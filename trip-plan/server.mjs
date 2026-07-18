@@ -14,6 +14,7 @@ const apiKey = process.env.OPENAI_API_KEY
 const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2' }
 const schema = { type: 'object', additionalProperties: false, properties: { title: { type: 'string' }, summary: { type: 'string' }, days: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { day: { type: 'string' }, theme: { type: 'string' }, activities: { type: 'array', items: { type: 'string' } } }, required: ['day', 'theme', 'activities'] } } }, required: ['title', 'summary', 'days'] }
 const send = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(body)) }
+const isItinerary = (value) => value && typeof value.title === 'string' && typeof value.summary === 'string' && Array.isArray(value.days) && value.days.length > 0 && value.days.every((day) => typeof day?.day === 'string' && typeof day.theme === 'string' && Array.isArray(day.activities) && day.activities.length > 0 && day.activities.every((activity) => typeof activity === 'string'))
 
 const demoTrips = {
   varanasi: { title: 'Sacred Varanasi: ghats, history, and flavor', days: [
@@ -57,21 +58,28 @@ function createDemoItinerary(details) {
     { day: 'Day 3', theme: 'Make the last day memorable', activities: ['See one quieter neighborhood or nearby nature spot.', 'Pick up local treats or souvenirs at a small market.', 'Leave time for a final meal at your favorite place from the trip.'] },
   ] }
   const interestText = details.interests?.length ? details.interests.join(' and ').toLowerCase() : 'local culture, food, and memorable sights'
-  return { ...itinerary, summary: `A flexible ${details.travelers || 'solo'} itinerary for ${details.dates || 'your chosen dates'}, shaped around ${interestText}.` }
+  const brief = details.brief?.trim() ? ` Your brief: ${details.brief.trim()}` : ''
+  return { ...itinerary, summary: `A flexible ${details.travelers || 'solo'} itinerary for ${details.dates || 'your chosen dates'}, shaped around ${interestText}.${brief}` }
 }
 
 async function itinerary(req, res) {
   let raw = ''; for await (const chunk of req) raw += chunk
+  if (raw.length > 10_000) return send(res, 413, { error: 'Your trip description is too long. Please keep it under 10,000 characters.' })
   let details; try { details = JSON.parse(raw) } catch { return send(res, 400, { error: 'Invalid request.' }) }
   if (!details.destination?.trim()) return send(res, 400, { error: 'Please enter a destination.' })
   if (!apiKey) return send(res, 200, createDemoItinerary(details))
-  const input = `Create a practical and inspiring 3-day itinerary for ${details.destination}. Dates: ${details.dates || 'flexible'}. Travelers: ${details.travelers || 'solo'}. Interests: ${(details.interests || []).join(', ') || 'local culture, food, and highlights'}. Group activities by area and do not claim bookings were made.`
+  const input = `Create a practical and inspiring 3-day itinerary for ${details.destination}. Dates: ${details.dates || 'flexible'}. Travelers: ${details.travelers || 'solo'}. Interests: ${(details.interests || []).join(', ') || 'local culture, food, and highlights'}. User brief: ${details.brief || 'No extra notes.'}. Group activities by area and do not claim bookings were made.`
   try {
-    const openai = await fetch('https://api.openai.com/v1/responses', { method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-5.6-sol', instructions: 'You are an expert travel planner. Return only the requested JSON.', input, text: { format: { type: 'json_schema', name: 'trip_itinerary', strict: true, schema } } }) })
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 15000)
+    const openai = await fetch('https://api.openai.com/v1/responses', { method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-5.6-sol', instructions: 'You are an expert travel planner. Return only the requested JSON.', input, text: { format: { type: 'json_schema', name: 'trip_itinerary', strict: true, schema } } }), signal: controller.signal })
+    clearTimeout(timeout)
     const data = await openai.json()
     if (!openai.ok) return send(res, openai.status, { error: data.error?.message || 'OpenAI could not create an itinerary.' })
-    return send(res, 200, JSON.parse(data.output_text))
-  } catch (error) { return send(res, 500, { error: error instanceof Error ? error.message : 'Unable to create itinerary.' }) }
+    let result; try { result = JSON.parse(data.output_text) } catch { return send(res, 502, { error: 'The AI returned malformed data. Please retry.' }) }
+    if (!isItinerary(result)) return send(res, 502, { error: 'The AI returned an incomplete itinerary. Please retry.' })
+    return send(res, 200, result)
+  } catch (error) { return send(res, error?.name === 'AbortError' ? 504 : 500, { error: error?.name === 'AbortError' ? 'The AI request timed out. Please retry.' : 'Unable to create itinerary. Please retry.' }) }
 }
 
 http.createServer(async (req, res) => {
